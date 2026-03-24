@@ -3113,6 +3113,85 @@ function cleanupOrphanedHooks(settings) {
 }
 
 /**
+ * Validate hook field requirements to prevent silent settings.json rejection.
+ *
+ * Claude Code validates the entire settings file with a strict Zod schema.
+ * If ANY hook has an invalid schema (e.g., type: "agent" missing "prompt"),
+ * the ENTIRE settings.json is silently discarded — disabling all plugins,
+ * env vars, and other configuration.
+ *
+ * This defensive check removes invalid hook entries and cleans up empty
+ * event arrays to prevent this. It validates:
+ *   - agent hooks require a "prompt" field
+ *   - command hooks require a "command" field
+ *   - entries must have a valid "hooks" array (non-array/missing is removed)
+ *
+ * @param {object} settings - The settings object (mutated in place)
+ * @returns {object} The same settings object
+ */
+function validateHookFields(settings) {
+  if (!settings.hooks || typeof settings.hooks !== 'object') return settings;
+
+  let fixedHooks = false;
+  const emptyKeys = [];
+
+  for (const [eventType, hookEntries] of Object.entries(settings.hooks)) {
+    if (!Array.isArray(hookEntries)) continue;
+
+    // Pass 1: validate each entry, building a new array without mutation
+    const validated = [];
+    for (const entry of hookEntries) {
+      // Entries without a hooks sub-array are structurally invalid — remove them
+      if (!entry.hooks || !Array.isArray(entry.hooks)) {
+        fixedHooks = true;
+        continue;
+      }
+
+      // Filter invalid hooks within the entry
+      const validHooks = entry.hooks.filter(h => {
+        if (h.type === 'agent' && !h.prompt) {
+          fixedHooks = true;
+          return false;
+        }
+        if (h.type === 'command' && !h.command) {
+          fixedHooks = true;
+          return false;
+        }
+        return true;
+      });
+
+      // Drop entries whose hooks are now empty
+      if (validHooks.length === 0) {
+        fixedHooks = true;
+        continue;
+      }
+
+      // Build a clean copy instead of mutating the original entry
+      validated.push({ ...entry, hooks: validHooks });
+    }
+
+    settings.hooks[eventType] = validated;
+
+    // Collect empty event arrays for removal (avoid delete during iteration)
+    if (validated.length === 0) {
+      emptyKeys.push(eventType);
+      fixedHooks = true;
+    }
+  }
+
+  // Pass 2: remove empty event arrays
+  for (const key of emptyKeys) {
+    delete settings.hooks[key];
+  }
+
+  if (fixedHooks) {
+    console.log(`  ${green}✓${reset} Fixed invalid hook entries (prevents settings.json schema rejection)`);
+  }
+
+  return settings;
+}
+
+/**
  * Uninstall GSD from the specified directory for a specific runtime
  * Removes only GSD-specific files/directories, preserves user content
  * @param {boolean} isGlobal - Whether to uninstall from global or local
@@ -4268,7 +4347,7 @@ function install(isGlobal, runtime = 'claude') {
   // Gemini and Antigravity use AfterTool instead of PostToolUse for post-tool hooks
   const postToolEvent = (runtime === 'gemini' || runtime === 'antigravity') ? 'AfterTool' : 'PostToolUse';
   const settingsPath = path.join(targetDir, 'settings.json');
-  const settings = cleanupOrphanedHooks(readSettings(settingsPath));
+  const settings = validateHookFields(cleanupOrphanedHooks(readSettings(settingsPath)));
   const statuslineCommand = isGlobal
     ? buildHookCommand(targetDir, 'gsd-statusline.js')
     : 'node ' + dirName + '/hooks/gsd-statusline.js';
@@ -4703,6 +4782,7 @@ if (process.env.GSD_TEST_MODE) {
     copyCommandsAsWindsurfSkills,
     writeManifest,
     reportLocalPatches,
+    validateHookFields,
   };
 } else {
 
